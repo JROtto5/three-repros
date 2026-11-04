@@ -3,7 +3,23 @@
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js", "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js", "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.tsl.js" } }
 </script></head>
-<body>
+<style>
+body{font:14px/1.5 system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;color:#222}
+code{background:#f2f2f2;padding:1px 4px;border-radius:3px} table{border-collapse:collapse;margin:12px 0}
+td,th{border:1px solid #ccc;padding:4px 10px;text-align:left} .bad{background:#ffe3e3} .ok{background:#e6f7e6}
+canvas{display:none} #status{font-weight:600}
+</style>
+<h2>three.js #34697: WebGPU timestamp queries of resumed / layered render passes</h2>
+<p>Renders one frame with <code>WebGPURenderer({ trackTimestamp: true })</code> using three.js <span id="ver"></span> and records the
+<code>timestampWrites</code> of every render pass the renderer begins. A pass that is <b>resumed</b> (after a framebuffer copy) or a
+<b>later layer</b> should only write the end timestamp of its render context. The bug: it writes the beginning timestamp again,
+or the indices of another pass.</p>
+<p>Cases: <a href="./">split by copy</a> · <a href="?reflector">nested reflector()</a> · <a href="?shadow">shadow pass</a> ·
+<a href="?layered">layered (ArrayCamera)</a> · <a href="?noglass">no split</a></p>
+<p id="status">Running…</p>
+<div id="out"></div>
+<script>window.addEventListener('error',e=>{document.getElementById('status').textContent='Error: '+e.message});
+window.addEventListener('unhandledrejection',e=>{document.getElementById('status').textContent='Error: '+(e.reason&&e.reason.message||e.reason)});</script>
 <script type="module">
 import * as THREE from 'three';
 import { viewportSharedTexture, screenUV, vec4, reflector } from 'three/tsl';
@@ -21,7 +37,10 @@ GPUCommandEncoder.prototype.beginRenderPass = function ( descriptor ) {
 
 };
 
+if ( ! navigator.gpu ) { document.getElementById( 'status' ).textContent = 'This browser has no WebGPU (try Chrome 113+).'; throw new Error( 'no WebGPU' ); }
 const adapter = await navigator.gpu.requestAdapter();
+if ( ! adapter || ! adapter.features.has( 'timestamp-query' ) ) { document.getElementById( 'status' ).textContent = 'WebGPU adapter without the timestamp-query feature: this repro needs it (Chrome: enable chrome://flags/#enable-webgpu-developer-features).'; throw new Error( 'no timestamp-query' ); }
+document.getElementById( 'ver' ).textContent = 'r' + THREE.REVISION;
 const device = await adapter.requestDevice( { requiredFeatures: [ 'timestamp-query', 'core-features-and-limits' ].filter( f => adapter.features.has( f ) ) } );
 const renderer = new THREE.WebGPURenderer( { trackTimestamp: ! new URLSearchParams( location.search ).has( 'nots' ), device } );
 renderer.setSize( 256, 256 );
@@ -117,6 +136,23 @@ for ( let i = 0; i < 4; i ++ ) {
 const frame = frameLog.map( e => ( { pass: e.uid, begin: e.begin, end: e.end, shared: e.tw !== undefined && frameLog.filter( o => o.tw === e.tw ).length > 1 } ) );
 const pool = backend.timestampQueryPool.render || { timestamps: new Map() };
 window.__result = { frame, timestamp: renderer.info.render.timestamp, perUID: Object.fromEntries( pool.timestamps ), lost: window.__lost, stack: window.__destroyStack };
+{
+	const seen = new Map(); let bad = 0;
+	const rows = frame.map( ( f ) => {
+		const id = f.pass.replace( / \(resumed.*\)$/, '' );
+		const resumed = f.pass.includes( 'resumed' ) || seen.has( id );
+		const other = [ ...seen.entries() ].find( ( [ uid, ix ] ) => uid !== id && ix.includes( f.begin ?? f.end ) );
+		const wrong = f.begin !== null && f.begin !== undefined && ( resumed || other );
+		if ( ! seen.has( id ) ) seen.set( id, [ f.begin, f.end ] );
+		if ( wrong ) bad ++;
+		const note = ! resumed ? 'first pass of its render context' : wrong ? ( other ? 'writes another pass\'s query slots' : 'writes the beginning timestamp again' ) : 'end-only write (correct)';
+		return `<tr class="${ resumed ? ( wrong ? 'bad' : 'ok' ) : '' }"><td>${ f.pass }${ resumed && ! f.pass.includes( 'resumed' ) ? ' (next layer)' : '' }</td><td>${ f.begin ?? '–' }</td><td>${ f.end ?? '–' }</td><td>${ note }</td></tr>`;
+	} );
+	document.getElementById( 'out' ).innerHTML = `<table><tr><th>render pass</th><th>begin index</th><th>end index</th><th></th></tr>${ rows.join( '' ) }</table>
+		<p>Reported <code>renderer.info.render.timestamp</code>: <b>${ ( window.__result.timestamp || 0 ).toFixed( 4 ) } ms</b></p>`;
+	document.getElementById( 'status' ).textContent = bad ? `Bug reproduced: ${ bad } pass(es) with a wrong timestamp write.` : 'No wrong timestamp writes in this case.';
+	document.getElementById( 'status' ).style.color = bad ? '#b00' : '#070';
+}
 await new Promise( r => setTimeout( r, 500 ) );
 window.__done = true;
 </script>

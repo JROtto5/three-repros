@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>#34697 repro</title>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js", "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js", "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.tsl.js" } }
+</script></head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { viewportSharedTexture, screenUV, vec4, reflector } from 'three/tsl';
+
+const log = [];
+window.__log = log;
+
+// Record the timestamp writes of every render pass that is begun.
+const begin = GPUCommandEncoder.prototype.beginRenderPass;
+GPUCommandEncoder.prototype.beginRenderPass = function ( descriptor ) {
+
+	const tw = descriptor.timestampWrites;
+	log.push( { uid: currentUID, label: descriptor.label, begin: tw ? tw.beginningOfPassWriteIndex : null, end: tw ? tw.endOfPassWriteIndex : null, tw } );
+	return begin.call( this, descriptor );
+
+};
+
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice( { requiredFeatures: [ 'timestamp-query', 'core-features-and-limits' ].filter( f => adapter.features.has( f ) ) } );
+const renderer = new THREE.WebGPURenderer( { trackTimestamp: ! new URLSearchParams( location.search ).has( 'nots' ), device } );
+renderer.setSize( 256, 256 );
+// Headless Chrome drops the WebGPU instance when presenting to a canvas, so render offscreen.
+const target = new THREE.RenderTarget( 256, 256, { samples: 0 } );
+document.body.appendChild( renderer.domElement );
+await renderer.init();
+renderer.shadowMap.enabled = true;
+const backend = renderer.backend;
+window.__lost = null; const _d = renderer.backend.device.destroy.bind( renderer.backend.device ); renderer.backend.device.destroy = () => { window.__destroyStack = new Error().stack; _d(); }; backend.device.lost.then( i => { window.__lost = i.reason + ': ' + i.message; } );
+const init = backend.initTimestampQuery;
+let currentUID = null;
+const copy = backend.copyFramebufferToTexture;
+backend.copyFramebufferToTexture = function ( texture, renderContext, rectangle ) { const prev = currentUID; currentUID = this.getTimestampUID( renderContext ) + ' (resumed after copy)'; const r = copy.call( this, texture, renderContext, rectangle ); currentUID = prev; return r; };
+backend.initTimestampQuery = function ( type, uid, descriptor, ...rest ) { if ( type === 'render' ) currentUID = uid; return init.call( this, type, uid, descriptor, ...rest ); };
+
+const camera = new THREE.PerspectiveCamera( 50, 1, 0.1, 100 );
+camera.position.set( 0, 2, 6 );
+camera.lookAt( 0, 0, 0 );
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color( 0x202020 );
+
+const light = new THREE.DirectionalLight( 0xffffff, 2 );
+light.position.set( 3, 5, 2 );
+light.castShadow = new URLSearchParams( location.search ).has( 'shadow' );
+scene.add( light );
+
+const ground = new THREE.Mesh( new THREE.PlaneGeometry( 10, 10 ), new THREE.MeshStandardMaterial() );
+ground.rotation.x = - Math.PI / 2;
+ground.receiveShadow = true;
+scene.add( ground );
+
+const box = new THREE.Mesh( new THREE.BoxGeometry(), new THREE.MeshStandardMaterial( { color: 0xff8800 } ) );
+box.castShadow = true;
+box.position.y = 0.5;
+scene.add( box );
+
+// Optional: a reflector renders the scene *nested* inside the main pass (ReflectorNode.updateBefore).
+if ( new URLSearchParams( location.search ).has( 'reflector' ) ) {
+
+	const reflection = reflector( { resolutionScale: 0.5 } );
+	reflection.target.rotateX( - Math.PI / 2 );
+	reflection.target.position.y = 0.01;
+	scene.add( reflection.target );
+	const mirrorMaterial = new THREE.MeshBasicNodeMaterial();
+	mirrorMaterial.colorNode = reflection;
+	const mirror = new THREE.Mesh( new THREE.PlaneGeometry( 4, 4 ), mirrorMaterial );
+	mirror.rotation.x = - Math.PI / 2;
+	mirror.position.y = 0.01;
+	scene.add( mirror );
+
+}
+
+// Transparent material reading the viewport -> framebuffer copy in the middle of the scene pass.
+const glassMaterial = new THREE.MeshBasicNodeMaterial( { transparent: true } );
+glassMaterial.colorNode = vec4( viewportSharedTexture( screenUV ).rgb.mul( 0.5 ), 0.8 );
+const glass = new THREE.Mesh( new THREE.SphereGeometry( 0.8 ), glassMaterial );
+glass.position.set( 1.2, 0.8, 1 );
+if ( ! new URLSearchParams( location.search ).has( 'noglass' ) ) scene.add( glass );
+
+const layered = new URLSearchParams( location.search ).has( 'layered' );
+let renderCamera = camera;
+let renderTarget = target;
+
+if ( layered ) {
+
+	// Layered render target + ArrayCamera, as used by WebXR: one render pass per layer in finishRender().
+	renderTarget = new THREE.RenderTarget( 256, 256, { depth: 2, depthBuffer: true, useArrayDepthTexture: true, samples: 0 } );
+	renderTarget.texture.isArrayTexture = true;
+
+	const left = camera.clone(); left.position.x -= 0.1; left.viewport = new THREE.Vector4( 0, 0, 256, 256 ); left.updateMatrixWorld();
+	const right = camera.clone(); right.position.x += 0.1; right.viewport = new THREE.Vector4( 0, 0, 256, 256 ); right.updateMatrixWorld();
+	renderCamera = new THREE.ArrayCamera( [ left, right ] );
+	renderCamera.position.copy( camera.position ); renderCamera.quaternion.copy( camera.quaternion );
+	renderCamera.updateMatrixWorld();
+
+}
+
+let frameLog;
+for ( let i = 0; i < 4; i ++ ) {
+
+	log.length = 0;
+	renderer.setRenderTarget( renderTarget );
+	renderer.render( scene, renderCamera );
+	frameLog = log.slice();
+	if ( renderer.backend.trackTimestamp ) await renderer.resolveTimestampsAsync( 'render' );
+	await new Promise( r => setTimeout( r, 50 ) );
+
+}
+
+// last frame only
+const frame = frameLog.map( e => ( { pass: e.uid, begin: e.begin, end: e.end, shared: e.tw !== undefined && frameLog.filter( o => o.tw === e.tw ).length > 1 } ) );
+const pool = backend.timestampQueryPool.render || { timestamps: new Map() };
+window.__result = { frame, timestamp: renderer.info.render.timestamp, perUID: Object.fromEntries( pool.timestamps ), lost: window.__lost, stack: window.__destroyStack };
+await new Promise( r => setTimeout( r, 500 ) );
+window.__done = true;
+</script>
+</body></html>

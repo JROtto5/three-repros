@@ -149,7 +149,7 @@ window.__result = { frame, timestamp: renderer.info.render.timestamp, perUID: Ob
 		return `<tr class="${ resumed ? ( wrong ? 'bad' : 'ok' ) : '' }"><td>${ f.pass }${ resumed && ! f.pass.includes( 'resumed' ) ? ' (next layer)' : '' }</td><td>${ f.begin ?? '–' }</td><td>${ f.end ?? '–' }</td><td>${ note }</td></tr>`;
 	} );
 	document.getElementById( 'out' ).innerHTML = `<table><tr><th>render pass</th><th>begin index</th><th>end index</th><th></th></tr>${ rows.join( '' ) }</table>
-		<p>Reported <code>renderer.info.render.timestamp</code>: <b>${ ( window.__result.timestamp || 0 ).toFixed( 4 ) } ms</b></p>`;
+		<p>Reported <code>renderer.info.render.timestamp</code>: <b>${ ( window.__result.timestamp || 0 ).toFixed( 4 ) } ms</b><br><small>Chrome quantizes timestamp queries unless <code>chrome://flags/#enable-webgpu-developer-features</code> is enabled, so this tiny scene can read 0 ms. The query indices above are what show the bug.</small></p>`;
 	document.getElementById( 'status' ).textContent = bad ? `Bug reproduced: ${ bad } pass(es) with a wrong timestamp write.` : 'No wrong timestamp writes in this case.';
 	document.getElementById( 'status' ).style.color = bad ? '#b00' : '#070';
 }
